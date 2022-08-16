@@ -97,7 +97,7 @@ eval_script.evaluate:
 
 # Load model with overrides.
 include 'models/t5_large.gin'
-models.EncoderDecoderModel.predict_batch_with_aux.num_decodes = 1
+models.EncoderDecoderModel.predict_batch_with_aux.beam_size = 2
 
 utils.DatasetConfig:
   mixture_or_task_name = 'natural_questions_open'
