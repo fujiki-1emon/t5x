@@ -296,18 +296,20 @@ def train(
     ]
   else:
     state_transforms_for_restore = []
-  restore_cfgs = [
-      utils.RestoreCheckpointConfig(
-          path=model_dir,
-          mode='latest',
-          dtype=checkpoint_cfg.save.dtype if checkpoint_cfg.save else 'float32',
-          checkpointer_cls=checkpoint_cfg.save.checkpointer_cls
-          if checkpoint_cfg.save else checkpoints.Checkpointer,
-          # Restore dataset state if it is being saved.
-          restore_dataset=(checkpoint_cfg.save and
-                           checkpoint_cfg.save.save_dataset),
-          state_transformation_fns=state_transforms_for_restore)
-  ]
+
+  restore_cfgs = []
+  # restore_cfgs = [
+  #     utils.RestoreCheckpointConfig(
+  #         path=model_dir,
+  #         mode='latest',
+  #         dtype=checkpoint_cfg.save.dtype if checkpoint_cfg.save else 'float32',
+  #         checkpointer_cls=checkpoint_cfg.save.checkpointer_cls
+  #         if checkpoint_cfg.save else checkpoints.Checkpointer,
+  #         # Restore dataset state if it is being saved.
+  #         restore_dataset=(checkpoint_cfg.save and
+  #                          checkpoint_cfg.save.save_dataset),
+  #         state_transformation_fns=state_transforms_for_restore)
+  # ]
   # 2. From a checkpoint specified by `checkpoint_cfg.restore.path`, if set.
   if checkpoint_cfg.restore:
     if checkpoint_cfg.restore.mode == 'all':
