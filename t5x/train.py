@@ -46,6 +46,8 @@ from t5x import trainer as trainer_lib
 from t5x import utils
 import tensorflow as tf
 
+import jax.profiler
+jax.profiler.start_server(9999)
 
 # Automatically search for gin files relative to the T5X package.
 _DEFAULT_GIN_SEARCH_PATHS = [
