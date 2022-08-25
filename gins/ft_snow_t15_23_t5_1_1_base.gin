@@ -1,0 +1,34 @@
+from __gin__ import dynamic_registration
+import __main__ as train_script
+
+import t5.data.mixtures
+from t5x import utils
+from t5x import models
+from t5x import trainer
+from t5x.examples.t5 import network
+import seqio
+import snow_task 
+
+include 't5x/examples/t5/t5_1_1/base.gin'
+include 't5x/configs/runs/finetune.gin'
+
+seqio.SentencePieceVocabulary.sentencepiece_model_file = "gs://large_language_models_ja/pre_training/spiece.model"
+seqio.SentencePieceVocabulary.extra_ids = 100
+
+# LOSS_NORMALIZING_FACTOR = 2048
+
+BATCH_SIZE = 1024
+MIXTURE_OR_TASK_NAME = "snow_t15_23"
+TASK_FEATURE_LENGTHS = {'inputs': 64, 'targets': 64}
+USE_CACHED_TASKS = False
+
+train_script.train:
+  train_dataset_cfg = @train/utils.DatasetConfig()
+  train_eval_dataset_cfg = @train_eval/utils.DatasetConfig()
+  eval_period = 100
+
+utils.SaveCheckpointConfig:
+  period = 100
+
+network.T5Config:
+  dtype = 'float32'
