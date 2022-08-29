@@ -11,7 +11,7 @@ vocab = seqio.SentencePieceVocabulary(sentencepiece_model_file, DEFAULT_EXTRA_ID
 
 TaskRegistry.add(
     "obpc_span_corruption",
-    source=seqio.TfdsDataSource(tfds_name="obpc_train_0_9:1.0.0"),
+    source=seqio.TfdsDataSource(tfds_name="obpc:1.0.0"),
     preprocessors=[
         functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
         seqio.preprocessors.tokenize,
