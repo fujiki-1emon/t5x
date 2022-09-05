@@ -19,6 +19,7 @@ r"""Script to pretrain or finetune in JAX using a SeqIO pipeline.
 import functools
 import math
 import os
+import threading
 import time
 from typing import Callable, Sequence, Mapping, Tuple, Type, Optional
 
@@ -46,6 +47,17 @@ from t5x import trainer as trainer_lib
 from t5x import utils
 import tensorflow as tf
 
+import jax.profiler
+# jax.profiler.start_server(9999)
+def initialise_memory_tracking():
+    def inner():
+        import time
+        while True:
+            jax.profiler.save_device_memory_profile('/dev/shm/memory.prof')
+            time.sleep(1.)
+
+    thread = threading.Thread(target=inner, daemon=True)
+    thread.start()
 
 # Automatically search for gin files relative to the T5X package.
 _DEFAULT_GIN_SEARCH_PATHS = [
@@ -294,18 +306,20 @@ def train(
     ]
   else:
     state_transforms_for_restore = []
-  restore_cfgs = [
-      utils.RestoreCheckpointConfig(
-          path=model_dir,
-          mode='latest',
-          dtype=checkpoint_cfg.save.dtype if checkpoint_cfg.save else 'float32',
-          checkpointer_cls=checkpoint_cfg.save.checkpointer_cls
-          if checkpoint_cfg.save else checkpoints.Checkpointer,
-          # Restore dataset state if it is being saved.
-          restore_dataset=(checkpoint_cfg.save and
-                           checkpoint_cfg.save.save_dataset),
-          state_transformation_fns=state_transforms_for_restore)
-  ]
+
+  restore_cfgs = []
+  # restore_cfgs = [
+  #     utils.RestoreCheckpointConfig(
+  #         path=model_dir,
+  #         mode='latest',
+  #         dtype=checkpoint_cfg.save.dtype if checkpoint_cfg.save else 'float32',
+  #         checkpointer_cls=checkpoint_cfg.save.checkpointer_cls
+  #         if checkpoint_cfg.save else checkpoints.Checkpointer,
+  #         # Restore dataset state if it is being saved.
+  #         restore_dataset=(checkpoint_cfg.save and
+  #                          checkpoint_cfg.save.save_dataset),
+  #         state_transformation_fns=state_transforms_for_restore)
+  # ]
   # 2. From a checkpoint specified by `checkpoint_cfg.restore.path`, if set.
   if checkpoint_cfg.restore:
     if checkpoint_cfg.restore.mode == 'all':
@@ -705,6 +719,8 @@ if __name__ == '__main__':
     _main(argv)
 
   def _main(argv: Sequence[str]):
+    initialise_memory_tracking()
+
     """True main function."""
     if len(argv) > 1:
       raise app.UsageError('Too many command-line arguments.')
