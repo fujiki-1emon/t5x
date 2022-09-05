@@ -19,6 +19,7 @@ r"""Script to pretrain or finetune in JAX using a SeqIO pipeline.
 import functools
 import math
 import os
+import threading
 import time
 from typing import Callable, Sequence, Mapping, Tuple, Type, Optional
 
@@ -47,7 +48,16 @@ from t5x import utils
 import tensorflow as tf
 
 import jax.profiler
-jax.profiler.start_server(9999)
+# jax.profiler.start_server(9999)
+def initialise_memory_tracking():
+    def inner():
+        import time
+        while True:
+            jax.profiler.save_device_memory_profile('/dev/shm/memory.prof')
+            time.sleep(1.)
+
+    thread = threading.Thread(target=inner, daemon=True)
+    thread.start()
 
 # Automatically search for gin files relative to the T5X package.
 _DEFAULT_GIN_SEARCH_PATHS = [
@@ -709,6 +719,8 @@ if __name__ == '__main__':
     _main(argv)
 
   def _main(argv: Sequence[str]):
+    initialise_memory_tracking()
+
     """True main function."""
     if len(argv) > 1:
       raise app.UsageError('Too many command-line arguments.')
