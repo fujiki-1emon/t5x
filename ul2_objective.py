@@ -1,25 +1,26 @@
 import functools
-import tensorflow as tf
-import seqio
-import t5.data
 from typing import Optional, Sequence
 
-# found this function and modified from https://github.com/GoogleCloudPlatform/t5x-on-vertex-ai/blob/main/tasks/custom_tasks.py#L78
-# UL2 paper appendix code missed this function
-def prepend_prompt(dataset: tf.data.Dataset,
-                   output_features: seqio.preprocessors.OutputFeaturesType,
-                   sequence_length: Optional[
-                       seqio.preprocessors.SequenceLengthType] = None,
-                   prompt_mode: str = "",
-                   key: str = "inputs",
-                   mode: str = "") -> tf.data.Dataset:
+import tensorflow.compat.v2 as tf
+import seqio
+import t5.data
+
+
+def prepend_prompt(
+    dataset: tf.data.Dataset,
+    output_features: seqio.preprocessors.OutputFeaturesType,
+    sequence_length: Optional[
+        seqio.preprocessors.SequenceLengthType] = None,
+    prompt_mode: str = "",
+    key: str = "inputs",
+    mode: str = ""
+) -> tf.data.Dataset:
     """Prepends a prompt at the beginning of an input sequence."""
     del sequence_length
     if prompt_mode and mode:
         # output_features may not have inputs key
         out_keys = list(output_features.keys())
-        prompt_tokens = output_features[out_keys[0]
-                                        ].vocabulary.encode_tf(prompt_mode)
+        prompt_tokens = output_features[out_keys[0]].vocabulary.encode_tf(prompt_mode)
 
         def add_to_inputs(x):
             x[key] = tf.concat([prompt_tokens, x[key]], axis=0)
@@ -28,9 +29,8 @@ def prepend_prompt(dataset: tf.data.Dataset,
         dataset = dataset.map(add_to_inputs)
     return dataset
 
-# modified from t5.data.preprocessors because output_features may not have inputs key
-def split_tokens_to_inputs_length(dataset, sequence_length,
-                                  output_features, **kwargs):
+
+def split_tokens_to_inputs_length(dataset, sequence_length, output_features, **kwargs):
     max_tokens = sequence_length['inputs']
     # output_features may not have inputs key
     out_keys = list(output_features.keys())
@@ -40,14 +40,13 @@ def split_tokens_to_inputs_length(dataset, sequence_length,
 
     return t5.data.preprocessors.split_tokens(dataset, max_tokens_per_segment=max_tokens, **kwargs)
 
-# modified from t5.data.preprocessors because output_features may not have inputs key
+
 def prefix_lm(dataset, sequence_length, output_features):
     """Prefix language modeling objective used in Raffel et al. 2019."""
     ds = dataset
-    ds = t5.data.preprocessors.select_random_chunk(ds, output_features=output_features,
-                                                   feature_key='targets', max_length=65536)
-    ds = split_tokens_to_inputs_length(ds, output_features=output_features,
-                                       sequence_length=sequence_length)
+    ds = t5.data.preprocessors.select_random_chunk(
+        ds, output_features=output_features, feature_key='targets', max_length=65536)
+    ds = split_tokens_to_inputs_length(ds, output_features=output_features, sequence_length=sequence_length)
     ds = t5.data.preprocessors.denoise(
         ds,
         output_features,
@@ -58,22 +57,24 @@ def prefix_lm(dataset, sequence_length, output_features):
     )
     return ds
 
-# copied from UL2 paper https://arxiv.org/pdf/2205.05131.pdf appendix chapter 9.2
-# note: modified to use the prefix_lm() from above instead of the default t5.data.preprocessors.prefix_lm() because output_features may not have inputs key
-def ul2_objective(dataset: tf.data.Dataset,
-                  sequence_length: seqio.preprocessors.SequenceLengthType,
-                  output_features: seqio.preprocessors.OutputFeaturesType,
-                  use_prefix_lm_task: bool = False,
-                  rates: Optional[Sequence[float]] = None,
-                  mean_noise_span_lengths: Sequence[float] = (3.0,),
-                  noise_densities: Sequence[float] = (0.15,),
-                  shard_ds: bool = True,
-                  optional_task_prefixes: Optional[Sequence[str]] = None,
-                  input_feature_key: str = "inputs",
-                  merge_examples_to_reduce_padding: bool = True,
-                  reserved_for_packing: bool = None,
-                  seed: int = 7) -> tf.data.Dataset:
+
+def ul2_objective(
+    dataset: tf.data.Dataset,
+    sequence_length: seqio.preprocessors.SequenceLengthType,
+    output_features: seqio.preprocessors.OutputFeaturesType,
+    use_prefix_lm_task: bool = False,
+    rates: Optional[Sequence[float]] = None,
+    mean_noise_span_lengths: Sequence[float] = (3.0,),
+    noise_densities: Sequence[float] = (0.15,),
+    shard_ds: bool = True,
+    optional_task_prefixes: Optional[Sequence[str]] = None,
+    input_feature_key: str = "inputs",
+    merge_examples_to_reduce_padding: bool = True,
+    reserved_for_packing: bool = None,
+    seed: int = 7
+) -> tf.data.Dataset:
     """UL2-like pre-training objectives.
+
     This preprocessor amounts to calling the 'span_corruption' function several
     times with different values of 'noise_density' and 'mean_noise_span_length'.
     We either shard or copy the dataset, then apply each function to each shard.
@@ -92,6 +93,7 @@ def ul2_objective(dataset: tf.data.Dataset,
         merge_examples_to_reduce_padding: if True, combines multiple input examples to reduce padding.
         reserved_for_packing: if specified, reduces the desired inputs length by the specified amount to enable multiple examples to be packed together downstream.
         seed: tf.int64 for controlling the random choice of spans.
+s
     Returns:
         a dataset
     """
@@ -100,8 +102,7 @@ def ul2_objective(dataset: tf.data.Dataset,
         num_tasks = len(noise_densities) + int(use_prefix_lm_task)
         valid_number_of_prefixes = num_tasks == len(optional_task_prefixes)
         if not valid_number_of_prefixes:
-            raise ValueError(
-                "Number of task prefixes must match number of tasks.")
+            raise ValueError("Number of task prefixes must match number of tasks.")
     inputs_length = sequence_length[input_feature_key]
     input_lengths, targets_lengths = [], []
     sequence_lengths = {x: y for x, y in sequence_length.items()}
@@ -169,8 +170,7 @@ def ul2_objective(dataset: tf.data.Dataset,
         processed_ds.append(ds)
     if use_prefix_lm_task:
         ds = ds_shards[-1]
-        ds = prefix_lm(
-            ds, sequence_lengths, output_features)
+        ds = prefix_lm(ds, sequence_lengths, output_features)
         if optional_task_prefixes:
             ds = prepend_prompt(
                 ds,
