@@ -18,6 +18,7 @@ import contextlib
 
 from absl.testing import absltest
 import jax
+from jax._src import dispatch as jax_dispatch
 import numpy as np
 from t5x import metrics as metrics_lib
 from t5x import models as models_lib
@@ -33,11 +34,11 @@ jax.config.parse_flags_with_absl()
 
 # Make `log_elapsed_time` a no-op to simplify mocking of `time.time()`.
 @contextlib.contextmanager
-def fake_log_elapsed_time(_):
+def fake_log_elapsed_time(_, event=None):  # pylint: disable=unused-argument
   yield
 
 
-jax._src.dispatch.log_elapsed_time = fake_log_elapsed_time
+jax_dispatch.log_elapsed_time = fake_log_elapsed_time
 
 
 def fake_accum_grads(model, optimizer, batch, rng, num_microbatches,
@@ -92,19 +93,19 @@ class MoeTrainerTest(absltest.TestCase):
     self.dataset = tf.data.Dataset.range(6).map(mapfn).batch(
         2, drop_remainder=True)
 
-    num_experts = 10
+    num_expert_partitions = 10
     self.test_trainer = trainer_lib.MoeTrainer(
         model=mock.create_autospec(models_lib.BaseModel, instance=True),
         train_state=self.init_train_state,
         partitioner=partitioning.MoePjitPartitioner(
-            num_experts=num_experts, num_partitions=1),
+            num_expert_partitions=num_expert_partitions, num_partitions=1),
         eval_names=['task1', 'task2'],
         summary_dir=model_dir,
         train_state_axes=train_state_axes,
         rng=np.ones(2, np.uint32),
         learning_rate_fn=lambda step: 2 * step,
         num_microbatches=None,
-        num_experts=num_experts)
+        num_expert_partitions=num_expert_partitions)
 
   @mock.patch('time.time')
   @mock.patch('t5x.trainer.accumulate_grads_microbatched', fake_accum_grads)

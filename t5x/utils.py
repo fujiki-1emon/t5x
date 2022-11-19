@@ -25,9 +25,10 @@ import os
 import re
 import time
 import typing
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, Type, Union, Protocol
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, Type, Union
 import warnings
 
+from absl import flags
 from absl import logging
 import clu.data
 from flax import traverse_util
@@ -35,8 +36,6 @@ import flax.core
 from flax.core import scope as flax_scope
 from flax.linen import partitioning as flax_partitioning
 import jax
-from jax import prng
-from jax import pxla
 from jax.experimental import global_device_array as gda_lib
 from jax.experimental import multihost_utils
 from jax.experimental.global_device_array import GlobalDeviceArray
@@ -54,6 +53,8 @@ from tensorflow.io import gfile
 import typing_extensions
 
 
+FLAGS = flags.FLAGS
+
 Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
 PyTreeDef = type(jax.tree_util.tree_structure(None))
 PartitionSpec = partitioning.PartitionSpec
@@ -62,9 +63,10 @@ Shape = Tuple[int, ...]
 
 # TODO(adarob): Remove namespace mapping after client gin files are updated.
 TensorBoardLogger = seqio.TensorBoardLogger
+get_local_data = checkpoints.get_local_data
 
 
-class EvaluatorConstructor(Protocol):
+class EvaluatorConstructor(typing_extensions.Protocol):
   """A function that returns an Evaluator.
 
   This protocol represents the actual callsite for the seqio.Evaluator c'tor
@@ -137,7 +139,7 @@ class SaveCheckpointConfig:
   state_transformation_fns: Sequence[checkpoints.SaveStateTransformationFn] = (
       dataclasses.field(default_factory=list))
   # Enable GDA in this Checkpointer.
-  use_gda: bool = False
+  use_gda: bool = True
 
   def __post_init__(self):
     if self.dtype not in (None, 'float32', 'bfloat16'):
@@ -178,7 +180,7 @@ class RestoreCheckpointConfig:
   state_transformation_fns: Sequence[
       checkpoints.RestoreStateTransformationFn] = ()
   # Enable GDA in this Checkpointer.
-  use_gda: bool = False
+  use_gda: bool = True
 
   def __post_init__(self):
     if self.mode not in ('specific', 'latest', 'all'):
@@ -224,6 +226,7 @@ class LegacyCheckpointer(orbax.checkpoint.Checkpointer):
   def save(self,
            path: str,
            item: train_state_lib.TrainState,
+           force: bool = False,
            state_transformation_fns: Sequence[
                checkpoints.SaveStateTransformationFn] = (),
            *,
@@ -233,6 +236,7 @@ class LegacyCheckpointer(orbax.checkpoint.Checkpointer):
     Args:
       path: path to save item to.
       item: a TrainState PyTree to save.
+      force: unused.
       state_transformation_fns: Transformations to apply, in order, to the state
         before writing.
       concurrent_gb: the approximate number of gigabytes of partitionable
@@ -249,7 +253,7 @@ class LegacyCheckpointer(orbax.checkpoint.Checkpointer):
 
   def restore(self,
               path: str,
-              item: Optional[train_state_lib.TrainState],
+              item: Optional[train_state_lib.TrainState] = None,
               state_transformation_fns: Sequence[
                   checkpoints.RestoreStateTransformationFn] = (),
               fallback_state: Optional[Mapping[str, Any]] = None,
@@ -300,14 +304,15 @@ class LegacyCheckpointManager(orbax.checkpoint.CheckpointManager):
 
   def __init__(self,
                *,
-               save_cfg: Optional[SaveCheckpointConfig] = None,
-               restore_cfg: RestoreCheckpointConfig,
+               save_cfg: Optional[SaveCheckpointConfig],
+               restore_cfg: Optional[RestoreCheckpointConfig],
                train_state_shape: train_state_lib.TrainState,
                partitioner: partitioning.BasePartitioner,
-               ds_iter: Optional[Union[tf.data.Iterator,
-                                       clu.data.DatasetIterator]] = None,
+               ds_iter: Optional[
+                   Union[tf.data.Iterator,
+                         clu.data.dataset_iterator.DatasetIterator]] = None,
                model_dir: Optional[str] = None,
-               use_gda: Optional[bool] = False):
+               use_gda: Optional[bool] = True):
     if save_cfg is not None:
       if save_cfg.save_dataset:
         assert ds_iter is not None
@@ -403,7 +408,7 @@ class LegacyCheckpointManager(orbax.checkpoint.CheckpointManager):
 @dataclasses.dataclass
 class DatasetConfig:
   """Configuration for loading a dataset from a SeqIO Task or Mixture."""
-  mixture_or_task_name: str
+  mixture_or_task_name: Union[str, seqio.Task, seqio.Mixture]
   task_feature_lengths: Mapping[str, int]
   split: str
   batch_size: int  # Number of examples per batch.
@@ -425,25 +430,32 @@ class DatasetConfig:
 
 def _get_index_mappings(device_to_idxs):
   """Get device and host to index set mappings for GDA construction."""
-  idx_to_devices = collections.defaultdict(set)
-  host_to_idx_set = collections.defaultdict(set)
+  host_to_idxs = collections.defaultdict(list)
+  idx_to_devices = collections.defaultdict(list)
   for d, idx in device_to_idxs.items():
-    host_to_idx_set[d.process_index].add(gda_lib._hashed_index(idx))  # pylint: disable=protected-access
-    idx_to_devices[gda_lib._hashed_index(idx)].add(d)  # pylint: disable=protected-access
+    hashed_idx = gda_lib._hashed_index(idx)  # pylint: disable=protected-access
+    # Only need one copy of each idx, since they are unique. Need to maintain
+    # original ordering though.
+    if hashed_idx not in host_to_idxs[d.process_index]:
+      host_to_idxs[d.process_index].append(hashed_idx)
+    # Index may correspond to multiple devices.
+    idx_to_devices[hashed_idx].append(d)
 
-  assert jax.process_index() in host_to_idx_set
-  for h1, set1 in host_to_idx_set.items():
-    for h2, set2 in host_to_idx_set.items():
+  assert jax.process_index() in host_to_idxs
+  for h1, idxs1 in host_to_idxs.items():
+    for idx in idxs1:
+      assert idx in idx_to_devices
+    for h2, idxs2 in host_to_idxs.items():
       if h1 == h2:
         continue
-      assert not (set1 & set2) or set1 == set2
+      assert not (set(idxs1) & set(idxs2)) or set(idxs1) == set(idxs2)
 
-  return host_to_idx_set, idx_to_devices
+  return host_to_idxs, idx_to_devices
 
 
 def _create_gda(partitioner: partitioning.BasePartitioner,
                 global_shapes: PyTreeDef, host_arrays: PyTreeDef) -> PyTreeDef:
-  """Create GDA from input arrays.
+  """Create GDA or jax.Array from input arrays.
 
   Example:
 
@@ -481,7 +493,7 @@ def _create_gda(partitioner: partitioning.BasePartitioner,
     # Mapping of host to a set of unique index slices for that host.
     # Mapping of index slice to a list of devices onto which the slice should be
     # placed.
-    host_to_idx_set, idx_to_devices = _get_index_mappings(device_to_idxs)
+    host_to_idxs, idx_to_devices = _get_index_mappings(device_to_idxs)
 
     shard_length = gda_lib.get_shard_shape(global_shape, global_mesh, axes)[0]
     num_shards = len(x) // shard_length
@@ -495,14 +507,15 @@ def _create_gda(partitioner: partitioning.BasePartitioner,
     # Construct mapping of device to index in the split local array.
     device_to_split_array_idx = {}
     i = 0
-    for _, idx_set in host_to_idx_set.items():
-      for idx in idx_set:
-        for d in idx_to_devices[idx]:
-          device_to_split_array_idx[d] = i % len(local_array_shards)
-        i += 1
+    for idx in host_to_idxs[jax.process_index()]:
+      assert idx in idx_to_devices
+      for d in idx_to_devices[idx]:
+        device_to_split_array_idx[d] = i % len(local_array_shards)
+      i += 1
 
     device_buffers = []
     for d in local_devices:
+      assert d in device_to_split_array_idx
       i = device_to_split_array_idx[d]
       device_buffers.append(jax.device_put(local_array_shards[i], d))
 
@@ -511,7 +524,11 @@ def _create_gda(partitioner: partitioning.BasePartitioner,
   device_buffers = jax.tree_map(_put_to_devices, host_arrays, global_shapes)
 
   def _gda(dbs, global_shape):
-    return GlobalDeviceArray(global_shape, global_mesh, axes, dbs)
+    if jax.config.jax_array:
+      return jax.make_array_from_single_device_arrays(
+          global_shape, jax.sharding.NamedSharding(global_mesh, axes), dbs)
+    else:
+      return GlobalDeviceArray(global_shape, global_mesh, axes, dbs)
 
   return jax.tree_map(
       _gda,
@@ -520,19 +537,19 @@ def _create_gda(partitioner: partitioning.BasePartitioner,
       is_leaf=lambda x: isinstance(x, (list, tuple)))
 
 
-class GDADatasetIterator(clu.data.DatasetIterator):
+class GDADatasetIterator(clu.data.dataset_iterator.DatasetIterator):
   """A wrapper iterator that returns GDA when the next element is requested."""
 
-  def __init__(self, iterator: clu.data.DatasetIterator,
+  def __init__(self, iterator: clu.data.dataset_iterator.DatasetIterator,
                partitioner: partitioning.BasePartitioner,
                global_shapes: PyTreeDef):
     self._iterator = iterator
     self._global_shapes = global_shapes
     self._partitioner = partitioner
 
-  def get_next(self):
+  def __next__(self):
     return _create_gda(self._partitioner, self._global_shapes,
-                       self._iterator.get_next())
+                       next(self._iterator))
 
   def reset(self):
     return self._iterator.reset()
@@ -544,13 +561,25 @@ class GDADatasetIterator(clu.data.DatasetIterator):
   def save(self, filename):
     return self._iterator.save(filename)
 
-  def load(self, filename):
-    return self._iterator.load(filename)
+  def restore(self, filename):
+    return self._iterator.restore(filename)
 
   @property
   def iterator(self):
     return self._iterator.iterator if isinstance(
         self._iterator, clu.data.TfDatasetIterator) else self._iterator
+
+
+def sync_global_devices(name: str) -> None:
+  """Creates a barrier with given name across all hosts/devices."""
+  # Internal mock TPU handling
+  multihost_utils.sync_global_devices(name)
+
+
+def multihost_assert_equal(input_tree, fail_message: str = ''):
+  """Verifies that all the hosts have the same tree of values."""
+  # Internal mock TPU handling
+  multihost_utils.assert_equal(input_tree, fail_message)
 
 
 #------------------------------------------------------------------------------
@@ -579,16 +608,7 @@ def _hardware_bernoulli(
 
 
 def set_hardware_rng_ops():
-  """Enable JAX Custom PRNG extension."""
-  jax.config.update('jax_enable_custom_prng', True)
-  # Use only fast TPU hardware PRNG with iterated-hash "split" substitute.
-  # Expected to be deterministic for a fixed partitioning.
-  # Monkey-patch JAX PRNGKey to use unsafe_rbg_prng_impl
-  # TODO(levskaya): replace with jax global config option once we debug it.
-  rbg_prng_key = functools.partial(prng.seed_with_impl,
-                                   prng.unsafe_rbg_prng_impl)
-  jax.random.PRNGKey = rbg_prng_key
-  jax._src.random.PRNGKey = rbg_prng_key  # pylint: disable=protected-access
+  jax.config.update('jax_default_prng_impl', 'unsafe_rbg')
 
 
 # -----------------------------------------------------------------------------
@@ -1130,7 +1150,7 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
                train_state: train_state_lib.TrainState,
                rng: Optional[jnp.ndarray] = None):
     ds_shapes = jax.tree_map(lambda x: jnp.array(x.shape), ds.element_spec)
-    multihost_utils.assert_equal(
+    multihost_assert_equal(
         ds_shapes, 'Dataset element shapes do not agree across hosts. '
         'This could be an indication that the dataset is nondeterministic.')
     try:
@@ -1138,7 +1158,7 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
       dataset_remainder = original_ds_length % batch_size  # pytype:disable=wrong-arg-types
       logging.info('length of dataset = %s', len(ds))
     except TypeError as e:
-      if str(e) == 'dataset length is unknown.':
+      if str(e).endswith('dataset length is unknown.'):
         logging.warning(
             'The following error is likely due to the use of TensorFlow v1 in '
             'your dataset pipeline. Verify you are not importing from '
@@ -1151,14 +1171,14 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
           'Padding infer dataset with %d examples for even per-replica shards.',
           dataset_pad_amt)
       # Pad with the first example using an index of -1 so seqio will ignore.
-      pad_ds = ds.take(1).map(lambda i, x: (np.int64(-1), x)).repeat(
+      pad_ds = ds.take(1).map(lambda i, x: (np.int64(-1), x)).cache().repeat(
           dataset_pad_amt)
       ds = ds.concatenate(pad_ds)
 
     # Shard the infer dataset across replica sets.
     sharded_ds = ds.shard(num_shards, shard_id).batch(
         per_shard_batch_size, drop_remainder=True)
-    multihost_utils.assert_equal(
+    multihost_assert_equal(
         jnp.array(len(sharded_ds)),
         'Dataset lengths do not agree across hosts.')
 
@@ -1177,15 +1197,30 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
       # [B, ...] -> [B * shard_count, ...]
       # partitioned_infer_step executes infer_step on sharded batched data, and
       # returns de-sharded batched indices and result replicated on all hosts.
-      batch_indices, batch_result = partitioned_infer_step(
-          train_state.params, infer_batch, step_rng, index)
-      logging.info('Inference of batch %s done.', index)
 
-      # Issue asynchronous copy request which serves as prefetching to the host.
+      if jax.config.jax_array and jax.process_count() > 1:
+        inputs = multihost_utils.host_local_array_to_global_array(
+            (infer_batch, step_rng, index), partitioner.mesh,
+            (partitioner.data_partition_spec, None,
+             partitioner.data_partition_spec))
+        batch_indices, batch_result = partitioned_infer_step(
+            train_state.params, *inputs)
+        batch_indices, batch_result = multihost_utils.global_array_to_host_local_array(
+            (batch_indices, batch_result), partitioner.mesh, (None, None))
+      else:
+        batch_indices, batch_result = partitioned_infer_step(
+            train_state.params, infer_batch, step_rng, index)
+        logging.info('Inference of batch %s done.', index)
+
       def _copy_to_host_async(x):
         if isinstance(x, GlobalDeviceArray):
-          x.local_data(0).copy_to_host_async()  # GDA is fully replicated
-          return x.local_data(0)
+          if hasattr(x, 'addressable_data'):
+            # GDA is fully replicated
+            x.addressable_data(0).copy_to_host_async()
+            return x.addressable_data(0)
+          else:
+            x.local_data(0).copy_to_host_async()  # GDA is fully replicated
+            return x.local_data(0)
         else:
           x.copy_to_host_async()
           return x
@@ -1237,9 +1272,10 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     # preserve structure of individual elements (inferences are not assumed to
     # be simple np.array). Finally, zip inferences with corresponding indices
     # and convert leaf np.arrays into lists.
-    all_inferences, struct = jax.tree_flatten(all_inferences)
+    all_inferences, struct = jax.tree_util.tree_flatten(all_inferences)
     all_inferences = map(
-        functools.partial(jax.tree_unflatten, struct), zip(*all_inferences))
+        functools.partial(jax.tree_util.tree_unflatten, struct),
+        zip(*all_inferences))
     indices_and_outputs = list(zip(all_indices, all_inferences))
     indices_and_outputs = jax.tree_map(lambda x: np.array(x).tolist(),
                                        indices_and_outputs)
@@ -1300,8 +1336,11 @@ def get_vocabulary(
         DeprecationWarning)
     import_module(cfg.module)
 
-  provider = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
-  features = provider.output_features
+  if isinstance(cfg.mixture_or_task_name, seqio.DatasetProviderBase):
+    mixture_or_task = cfg.mixture_or_task_name
+  else:
+    mixture_or_task = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
+  features = mixture_or_task.output_features
 
   if 'inputs' in features and 'targets' in features:
     return (features['inputs'].vocabulary, features['targets'].vocabulary)
@@ -1331,6 +1370,33 @@ def get_vocabulary(
   return (first_vocab, first_vocab)
 
 
+def verify_matching_vocabs(cfg: DatasetConfig, model: Any):
+  """Verify whether the task vocab matches the model vocab.
+
+  The seqio Task and the Model both define their vocabularies
+  separately, but these vocabularies must match or else the training/inference
+  results will not be sensible. This functions validates that they do match,
+  under the assumption that this is a standard Encoder-only, Decoder-only,
+  or Encoder-decoder model.
+
+  Args:
+    cfg: The DatasetConfig of the training/inference task.
+    model: A BaseTransformerModel model with input_vocabulary and
+      output_vocabulary attributes.
+
+  Raises:
+    ValueError: If the task vocabulary does not match the model vocabulary.
+  """
+  ds_vocabs = get_vocabulary(cfg)
+  if (ds_vocabs[0] != model.input_vocabulary or
+      ds_vocabs[1] != model.output_vocabulary):
+    raise ValueError(f'Model and Task vocabularies do not match:\n'
+                     f'  task={cfg.mixture_or_task_name}\n'
+                     f'  ds_vocabs=({ds_vocabs[0]}, {ds_vocabs[1]})\n'
+                     f'  model.input_vocabulary={model.input_vocabulary}\n'
+                     f'  model.output_vocabulary={model.output_vocabulary}\n')
+
+
 
 
 def get_dataset(cfg: DatasetConfig,
@@ -1354,14 +1420,14 @@ def get_dataset(cfg: DatasetConfig,
         f'Batch size ({cfg.batch_size}) must be divisible by number of '
         f'shards ({num_shards}).')
 
+  seed = cfg.seed
+
 
   shard_info = seqio.ShardInfo(index=shard_id, num_shards=num_shards)
 
-  if cfg.seed is None:
+  if seed is None:
     # Use a shared timestamp across devices as the seed.
     seed = multihost_utils.broadcast_one_to_all(np.int32(time.time()))
-  else:
-    seed = cfg.seed
 
   return get_dataset_inner(cfg, shard_info, feature_converter_cls, seed,
                            num_epochs)
@@ -1375,17 +1441,22 @@ def get_dataset_inner(cfg: DatasetConfig,
                       num_epochs: Optional[int] = None):
   """Internal fn to load a dataset from SeqIO based on a `DatasetConfig`."""
   batch_size = cfg.batch_size // shard_info.num_shards
+  if isinstance(cfg.mixture_or_task_name, seqio.DatasetProviderBase):
+    mixture_or_task = cfg.mixture_or_task_name
+  else:
+    mixture_or_task = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
   if seed is not None:
-    multihost_utils.assert_equal(
-        np.array(seed),
-        f'`seed` is not same across hosts; {jax.process_index} has a seed of '
-        f'{seed}')
+    if not str(jax.devices()[0]).startswith('MOCK_TPU'):
+      multihost_assert_equal(
+          np.array(seed),
+          f'`seed` is not same across hosts; {jax.process_index} has a seed of '
+          f'{seed}')
     logging.info(
         "Initializing dataset for task '%s' with a replica batch size of %d and "
-        'a seed of %d', cfg.mixture_or_task_name, batch_size, seed)
+        'a seed of %d', mixture_or_task.name, batch_size, seed)
 
-  ds = seqio.get_dataset(
-      mixture_or_task_name=cfg.mixture_or_task_name,
+  return seqio.get_dataset(
+      mixture_or_task_name=mixture_or_task,
       task_feature_lengths=cfg.task_feature_lengths,
       dataset_split=cfg.split,
       shuffle=cfg.shuffle,
@@ -1395,9 +1466,8 @@ def get_dataset_inner(cfg: DatasetConfig,
       shard_info=shard_info,
       use_cached=cfg.use_cached,
       seed=seed,
-      trim_output_features=cfg.trim_output_features)
-  ds = ds.batch(batch_size, drop_remainder=True)
-  return ds
+      trim_output_features=cfg.trim_output_features,
+      batch_size=batch_size)
 
 
 class GetDatasetCallable(typing_extensions.Protocol):
@@ -1411,7 +1481,7 @@ class GetDatasetCallable(typing_extensions.Protocol):
       feature_converter_cls: Callable[..., seqio.FeatureConverter],
       num_epochs: Optional[int] = None,
       continue_from_last_checkpoint: bool = True
-  ) -> Union[clu.data.DatasetIterator, tf.data.Dataset]:
+  ) -> Union[clu.data.dataset_iterator.DatasetIterator, tf.data.Dataset]:
     ...
 
 
@@ -1436,7 +1506,10 @@ def get_training_eval_datasets(
     start_step: int = 0,
 ) -> Mapping[str, tf.data.Dataset]:
   """Returns a mapping from eval task name to its dataset."""
-  mixture_or_task = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
+  if isinstance(cfg.mixture_or_task_name, seqio.DatasetProviderBase):
+    mixture_or_task = cfg.mixture_or_task_name
+  else:
+    mixture_or_task = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
   datasets = {}
   get_dataset_fn = get_dataset
   if deterministic:
@@ -1577,17 +1650,3 @@ def override_params_axes_names(
   return flax.core.freeze(model_variables)
 
 
-
-
-def get_local_data(x):
-  """Get local buffer for input data."""
-  if isinstance(x, GlobalDeviceArray):
-    val = x.local_data(0)
-    return val
-  elif isinstance(x, pxla.ShardedDeviceArray):
-    val = x.device_buffers[0]
-    if val.aval is None:
-      val.aval = jax.ShapedArray(val.shape, val.dtype)
-    return val
-  else:
-    return x

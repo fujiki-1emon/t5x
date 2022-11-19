@@ -27,6 +27,7 @@ from flax.linen import partitioning as flax_partitioning
 import jax
 from jax import numpy as jnp
 from jax import random
+from jax.experimental import multihost_utils
 from jax.experimental import PartitionSpec
 from jax.experimental.maps import Mesh
 from jax.experimental.mesh_utils import create_hybrid_device_mesh
@@ -64,9 +65,30 @@ class AxisNames(tuple):
 
 
 # pjit wrappers for cpu fallback.
+# ----------------------------------------------------------------------------
+# TODO(levskaya): This function is now no different than jax_pjit, but callers
+# currently depend on `backend` argument
+def pjit(
+    fun: Callable,  # pylint: disable=g-bare-generic
+    in_axis_resources,
+    out_axis_resources,
+    static_argnums: Union[int, Sequence[int]] = (),
+    donate_argnums: Union[int, Sequence[int]] = (),
+    backend: Optional[str] = None):
+  """Wrapper for pjit."""
+  del backend
+  return jax_pjit(
+      fun,
+      in_axis_resources,
+      out_axis_resources,
+      static_argnums=static_argnums,
+      donate_argnums=donate_argnums)
+
+
+# pjit wrappers for cpu fallback.
 # -----------------------------------------------------------------------------
 # TODO(levskaya): upstream this fallback behavior to jax pjit.
-def pjit(
+def pjit_with_cpu_fallback(
     fun: Callable,  # pylint: disable=g-bare-generic
     in_axis_resources,
     out_axis_resources,
@@ -375,8 +397,10 @@ def default_mesh(num_partitions: int,
         mps = (1, 1, 16, 1)
       elif bounds[0] >= 8:
         mps = (8, 2, 1, 1)
-      else:
+      elif bounds[0] >= 4:
         mps = (4, 4, 1, 1)
+      else:
+        mps = (2, 2, 4, 1)
 
   if mps is None:
     raise ValueError('No default mesh for this configuration: specify '
@@ -544,7 +568,8 @@ def _id_fn(x, ix):
   """Identity function for copying parameters to the devices, sharded."""
   # A pure identity such as `lambda x, *: x` can get optimized away, so we
   # include a random.split as a cheap function that cannot be optimized away.
-  return x, random.split(jnp.array([ix, ix], dtype=jnp.uint32))
+  y = random.split(random.PRNGKey(jnp.array(ix, dtype=jnp.uint32)))
+  return x, y
 
 
 @dataclasses.dataclass
@@ -658,9 +683,9 @@ class BasePartitioner(metaclass=abc.ABCMeta):
     replica_id = self._local_chunker.get_local_chunk_info(
         (batch_size,), [self._data_axis]).replica_id
     return DataLayout(
-        batch_size=batch_size,
-        shard_id=self._local_chunker.chunk_ids[self._data_axis],
-        num_shards=num_shards,
+        batch_size=int(batch_size),
+        shard_id=int(self._local_chunker.chunk_ids[self._data_axis]),
+        num_shards=int(num_shards),
         is_first_host_in_replica_set=(replica_id == 0))
 
   def get_local_chunk_info(
@@ -681,6 +706,9 @@ class BasePartitioner(metaclass=abc.ABCMeta):
         in_axis_resources=(train_state_axes, None),
         out_axis_resources=(train_state_axes, None),
         donate_argnums=(0,))
+    if jax.config.jax_array and jax.process_count() > 1:
+      train_state = multihost_utils.host_local_array_to_global_array(
+          train_state, self.mesh, train_state_axes)
     train_state, _ = p_id_fn(train_state, jnp.ones((), dtype=jnp.uint32))
     return train_state
 
@@ -823,7 +851,8 @@ class PjitPartitioner(BasePjitPartitioner):
                model_parallel_submesh: Optional[HardwareMesh] = None,
                params_on_devices: bool = True,
                backend: Optional[str] = None,
-               logical_axis_rules: Optional[LogicalAxisRules] = None):
+               logical_axis_rules: Optional[LogicalAxisRules] = None,
+               use_cpu_pjit: Optional[bool] = False):
     """PjitPartitioner constructor.
 
     See https://github.com/google-research/text-to-text-transfer-transformer/blob/main/README.mdx/usage/partitioning for details.
@@ -857,6 +886,8 @@ class PjitPartitioner(BasePjitPartitioner):
         logical axis names to either `None` (not sharded), 'model' (to shard
         across the model-parallel submesh), or 'data' (to shard across the
         data-parallel submesh).
+      use_cpu_pjit: enables wrapper function for pjit which just jits the
+        function if using CPU backend.
     """
     super().__init__(
         num_partitions=num_partitions,
@@ -868,6 +899,7 @@ class PjitPartitioner(BasePjitPartitioner):
     self._logical_axis_rules = tuple(logical_axis_rules)
     self._data_axis, = flax_partitioning.logical_to_mesh_axes(
         ['batch'], logical_axis_rules)
+    self._use_cpu_pjit = use_cpu_pjit
 
   def partition(
       self,
@@ -878,7 +910,11 @@ class PjitPartitioner(BasePjitPartitioner):
       donate_argnums: Union[int, Sequence[int]] = ()
   ) -> PjittedFnWithContext:
     """Partitions the function using jax.pjit."""
-    pjitted = pjit(
+    if self._use_cpu_pjit:
+      pjit_fn = pjit_with_cpu_fallback
+    else:
+      pjit_fn = pjit
+    pjitted = pjit_fn(
         fn,
         in_axis_resources=in_axis_resources,
         out_axis_resources=out_axis_resources,

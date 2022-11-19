@@ -20,6 +20,7 @@ from absl.testing import absltest
 from flax import core as flax_core
 from flax.linen import partitioning as flax_partitioning
 import jax
+from jax._src.lib import xla_bridge
 import numpy as np
 import optax
 from t5x import optimizers
@@ -69,7 +70,7 @@ class PartitioningTest(absltest.TestCase):
 
   @mock.patch('jax.local_devices')
   @mock.patch('jax.devices')
-  @mock.patch('jax._src.lib.xla_bridge.process_index')
+  @mock.patch.object(xla_bridge, 'process_index')
   def test_default_mesh(self, process_index_fn, devices_fn, local_devices_fn):
     # Mesh with 8 devices.
     devices = test_utils.make_devices(2, 2, 1, 2, kind='TPU v3')
@@ -78,28 +79,32 @@ class PartitioningTest(absltest.TestCase):
     process_index_fn.return_value = 0
 
     with self.subTest(name='more_experts_than_devices'):
-      mesh = moe_partitioning.default_moe_mesh(num_experts=16, num_partitions=1)
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=16, num_partitions=1)
       self.assertEqual(mesh.devices.shape, (1, 8, 1))
       self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
 
     with self.subTest(name='equal_experts_and_devices'):
-      mesh = moe_partitioning.default_moe_mesh(num_experts=8, num_partitions=1)
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=8, num_partitions=1)
       self.assertEqual(mesh.devices.shape, (1, 8, 1))
       self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
 
     with self.subTest(name='fewer_experts_than_devices'):
-      mesh = moe_partitioning.default_moe_mesh(num_experts=4, num_partitions=1)
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=4, num_partitions=1)
       self.assertEqual(mesh.devices.shape, (2, 4, 1))
       self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
 
     with self.subTest(name='nontrivial_model_partitions'):
-      mesh = moe_partitioning.default_moe_mesh(num_experts=8, num_partitions=4)
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=8, num_partitions=4)
       self.assertEqual(mesh.devices.shape, (1, 2, 4))
       self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
 
     with self.subTest(name='specified_model_parallel_submesh'):
       mesh = moe_partitioning.default_moe_mesh(
-          num_experts=8, model_parallel_submesh=(1, 1, 1, 2))
+          num_expert_partitions=8, model_parallel_submesh=(1, 1, 1, 2))
       self.assertEqual(mesh.devices.shape, (1, 4, 2))
       self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
 
@@ -115,7 +120,7 @@ class PartitioningTest(absltest.TestCase):
 
   @mock.patch('jax.local_devices')
   @mock.patch('jax.devices')
-  @mock.patch('jax._src.lib.xla_bridge.process_index')
+  @mock.patch.object(xla_bridge, 'process_index')
   def test_local_chunker_moe_usage(self, process_index_fn, devices_fn,
                                    local_devices_fn):
     # The MoE partitioning library uses a 2D "data" mesh spanning ('expert',
@@ -132,7 +137,7 @@ class PartitioningTest(absltest.TestCase):
 
     num_expert_partitions = 8
     moe_mesh = moe_partitioning.default_moe_mesh(
-        num_experts=num_expert_partitions, num_partitions=2)
+        num_expert_partitions=num_expert_partitions, num_partitions=2)
     moe_chunker = base_partitioning.LocalChunker(moe_mesh)
 
     base_mesh = base_partitioning.default_mesh(num_partitions=2)
@@ -150,7 +155,7 @@ class PartitioningTest(absltest.TestCase):
 
   @mock.patch('jax.local_devices')
   @mock.patch('jax.devices')
-  @mock.patch('jax._src.lib.xla_bridge.process_index')
+  @mock.patch.object(xla_bridge, 'process_index')
   def test_local_chunker_data_layout(self, process_index_fn, devices_fn,
                                      local_devices_fn):
     # Mesh with 32 devices.
@@ -161,7 +166,7 @@ class PartitioningTest(absltest.TestCase):
     for process_index, shard_id in zip([0, 1, 2, 3], [0, 2, 1, 3]):
       process_index_fn.return_value = process_index
       partitioner = moe_partitioning.MoePjitPartitioner(
-          num_experts=8, num_partitions=1)
+          num_expert_partitions=8, num_partitions=1)
       self.assertEqual(
           partitioner.get_data_layout(batch_size=32),
           DataLayout(
@@ -172,7 +177,7 @@ class PartitioningTest(absltest.TestCase):
 
   def test_logical_axes_for_moe_partitioner_no_overrides(self):
     partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8,
+        num_expert_partitions=8,
         num_partitions=1,
         state_filter_fn=training_utils.match_fn(r'no_state_matching'))
 
@@ -213,7 +218,7 @@ class PartitioningTest(absltest.TestCase):
 
   def test_logical_axes_for_moe_partitioner_with_overrides(self):
     partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8,
+        num_expert_partitions=8,
         num_partitions=1,
         state_filter_fn=training_utils.match_fn(r'.*mlp.*'))
 
@@ -255,7 +260,7 @@ class PartitioningTest(absltest.TestCase):
 
   def test_inference_state_logical_axes(self):
     partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8, num_partitions=1)
+        num_expert_partitions=8, num_partitions=1)
 
     model_variables = flax_core.freeze({
         'params': {
@@ -318,7 +323,7 @@ class PartitioningTest(absltest.TestCase):
 
   def test_data_partition_spec(self):
     partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=2, num_partitions=1)
+        num_expert_partitions=2, num_partitions=1)
     self.assertEqual(partitioner.data_partition_spec,
                      PartitionSpec(('expert', 'data'),))
 
