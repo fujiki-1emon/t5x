@@ -89,3 +89,21 @@ TaskRegistry.add(
     },
     metric_fns=[metrics.accuracy]
 )
+
+
+TaskRegistry.add(
+    "pre_training.ja_large_publics.sc",
+    source=seqio.TfdsDataSource(tfds_name="ja_large_publics:1.0.0"),
+    preprocessors=[
+        functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
+        seqio.preprocessors.tokenize,
+        seqio.CacheDatasetPlaceholder(),
+        preprocessors.span_corruption,
+        seqio.preprocessors.append_eos_after_trim,
+    ],
+    output_features={
+        "inputs": seqio.Feature(vocabulary=vocab, add_eos=True, required=False), 
+        "targets": seqio.Feature(vocabulary=vocab, add_eos=True),
+    },
+    metric_fns=[],
+)
