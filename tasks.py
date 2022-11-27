@@ -58,3 +58,34 @@ TaskRegistry.add(
     },
     metric_fns=[metrics.accuracy]
 )
+
+
+TaskRegistry.add(
+   "pre_training.ja_large_publics.ul2_objective",
+    source=seqio.TfdsDataSource(tfds_name="ja_large_publics:1.0.0"),
+    preprocessors=[
+        functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
+        seqio.preprocessors.tokenize,
+        seqio.CacheDatasetPlaceholder(),
+        functools.partial(
+            ul2_objective,
+            # shard_ds=False,
+            use_prefix_lm_task=True,
+            rates=[0.4 / len(R_DENOISER_SPAN_LENGTHS)] * len(R_DENOISER_SPAN_LENGTHS) \
+                + [0.4 / len(X_DENOISER_SPAN_LENGTHS)] * len(X_DENOISER_SPAN_LENGTHS) \
+                + [0.2],
+            mean_noise_span_lengths=R_DENOISER_SPAN_LENGTHS + X_DENOISER_SPAN_LENGTHS,
+            noise_densities=R_DENOISER_CORRUPT_RATES + X_DENOISER_CORRUPT_RATES,
+            optional_task_prefixes=[R_DENOISER_TOKEN_PREFIX] * len(R_DENOISER_SPAN_LENGTHS) \
+                + [X_DENOISER_TOKEN_PREFIX] * len(X_DENOISER_SPAN_LENGTHS) \
+                + [S_DENOISER_TOKEN_PREFIX],
+            reserved_for_packing=True,
+        ),
+        seqio.preprocessors.append_eos_after_trim,
+    ],
+    output_features={
+        "inputs": DEFAULT_OUTPUT_FEATURES["inputs"],
+        "targets": DEFAULT_OUTPUT_FEATURES["targets"],
+    },
+    metric_fns=[metrics.accuracy]
+)
