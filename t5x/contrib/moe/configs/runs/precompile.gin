@@ -1,31 +1,29 @@
-# Evaluate a Mixture of Experts model.
+# Mixture of Experts defaults for precompile mode in main.py.
 #
-#
-# You must also include bindings for MODEL.
+# You must also include a binding for MODEL.
 #
 # Required to be set:
 #
 # - NUM_MODEL_PARTITIONS or MODEL_PARALLEL_SUBMESH (only specify one)
 # - MIXTURE_OR_TASK_NAME
-# - CHECKPOINT_PATH
-# - EVAL_OUTPUT_DIR
+# - TASK_FEATURE_LENGTHS
+# - TRAIN_STEPS
+# - MODEL_DIR: # automatically set when using xm_launch
+#
+# Commonly overridden options (see also t5x/configs/runs/precompile.gin):
+#
+# - USE_CACHED_TASKS
+# - BATCH_SIZE
 #
 # You can also specify the upper bound for the size of the expert parallel
 # submesh by overriding NUM_EXPERT_PARTITIONS, which defaults to NUM_EXPERTS.
-#
-# Commonly overridden options (see also t5x/configs/runs/eval.gin):
-#
-# - DROPOUT_RATE
-# - BATCH_SIZE
 
 from __gin__ import dynamic_registration
 
-import __main__ as eval_script
-
+import __main__ as train_script
 from t5x.contrib.moe import partitioning as moe_partitioning
-from t5x import utils
 
-include 't5x/configs/runs/eval.gin'
+include 't5x/configs/runs/precompile.gin'
 
 # One of these should be overridden.
 NUM_MODEL_PARTITIONS = None
@@ -38,10 +36,8 @@ MODEL_PARALLEL_SUBMESH = None
 NUM_EXPERT_PARTITIONS = %NUM_EXPERTS
 
 # We use the MoE partitioner.
-eval_script.evaluate.partitioner = @moe_partitioning.MoePjitPartitioner()
+train_script.precompile.partitioner = @moe_partitioning.MoePjitPartitioner()
 moe_partitioning.MoePjitPartitioner:
   num_expert_partitions = %NUM_EXPERT_PARTITIONS
   num_partitions = %NUM_MODEL_PARTITIONS
   model_parallel_submesh = %MODEL_PARALLEL_SUBMESH
-
-utils.DatasetConfig.batch_size = %BATCH_SIZE

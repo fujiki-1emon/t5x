@@ -225,8 +225,6 @@ class OptaxStatePartitionRules:
           lambda state, params_axes: optax.ScaleByTrustRatioState(),
       optax.ScaleByScheduleState:
           lambda state, params_axes: optax.ScaleByScheduleState(count=None),
-      optax.ScaleByFromageState:
-          lambda state, params_axes: optax.ScaleByFromageState(count=None),
       optax.ZeroNansState:
           lambda state, params_axes: optax.ZeroNansState(found_nan=None),
       # FactoredState
@@ -298,7 +296,7 @@ class OptaxStatePartitionRules:
   def derive_optax_logical_axes(cls, optax_state, params_axes):
     """Derived logical axes for optax state."""
     # Flatten the optax state but do not go into the registered states.
-    flattened_state, tree_def = jax.tree_flatten(
+    flattened_state, tree_def = jax.tree_util.tree_flatten(
         optax_state, is_leaf=cls._is_optax_state)
 
     def derive_fn(x):
@@ -310,7 +308,7 @@ class OptaxStatePartitionRules:
       return cls._RULES[type(x)](x, params_axes)
 
     flattened_axes = [derive_fn(x) for x in flattened_state]
-    derived_axes = jax.tree_unflatten(tree_def, flattened_axes)
+    derived_axes = jax.tree_util.tree_unflatten(tree_def, flattened_axes)
     return derived_axes
 
 
