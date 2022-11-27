@@ -30,7 +30,7 @@ S_DENOISER_TOKEN_PREFIX = '[S2S]'
 
 
 TaskRegistry.add(
-   "pre-training_obpc_ul2-objective",
+   "pre_training.obpc.ul2_objective",
     source=seqio.TfdsDataSource(tfds_name="obpc:1.0.0"),
     preprocessors=[
         functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
