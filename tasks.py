@@ -10,7 +10,7 @@ from ul2_objective import ul2_objective
 
 TaskRegistry = seqio.TaskRegistry
 
-sentencepiece_model_file = "gs://large_language_models_ja_v3/spiece.model"
+sentencepiece_model_file = "gs://large_language_models_ja/spiece.model"
 vocab = seqio.SentencePieceVocabulary(sentencepiece_model_file, DEFAULT_EXTRA_IDS)
 DEFAULT_OUTPUT_FEATURES = {
     "inputs": seqio.Feature(vocabulary=vocab, add_eos=True, required=False),
@@ -103,6 +103,23 @@ TaskRegistry.add(
     ],
     output_features={
         "inputs": seqio.Feature(vocabulary=vocab, add_eos=True, required=False), 
+        "targets": seqio.Feature(vocabulary=vocab, add_eos=True),
+    },
+    metric_fns=[],
+)
+
+TaskRegistry.add(
+    "pre_training.obpc.span_corruption",
+    source=seqio.TfdsDataSource(tfds_name="obpc:1.0.0"),
+    preprocessors=[
+        functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
+        seqio.preprocessors.tokenize,
+        seqio.CacheDatasetPlaceholder(),
+        preprocessors.span_corruption,
+        seqio.preprocessors.append_eos_after_trim,
+    ],
+    output_features={
+        "inputs": seqio.Feature(vocabulary=vocab, add_eos=True, required=False),
         "targets": seqio.Feature(vocabulary=vocab, add_eos=True),
     },
     metric_fns=[],
