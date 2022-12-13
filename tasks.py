@@ -124,3 +124,44 @@ TaskRegistry.add(
     },
     metric_fns=[],
 )
+
+
+vocab_for_full_lm = seqio.SentencePieceVocabulary("gs://large_language_models_ja_v3/spiece.model")
+
+
+TaskRegistry.add(
+    "pre_training.ja_large_publics.full_lm",
+    source=seqio.TfdsDataSource(tfds_name="ja_large_publics:1.0.0"),
+    preprocessors=[
+        functools.partial(
+            preprocessors.rekey, key_map={
+                "inputs": None,
+                "targets": "text"
+            }),
+        seqio.preprocessors.tokenize,
+        seqio.CacheDatasetPlaceholder(),
+        preprocessors.full_lm,
+    ],
+    output_features={
+        "targets": seqio.Feature(vocabulary=vocab_for_full_lm, add_eos=True)
+    },
+    metric_fns=[],)
+
+
+TaskRegistry.add(
+    "pre_training.obpc.full_lm",
+    source=seqio.TfdsDataSource(tfds_name="obpc:1.0.0"),
+    preprocessors=[
+        functools.partial(
+            preprocessors.rekey, key_map={
+                "inputs": None,
+                "targets": "text"
+            }),
+        seqio.preprocessors.tokenize,
+        seqio.CacheDatasetPlaceholder(),
+        preprocessors.full_lm,
+    ],
+    output_features={
+        "targets": seqio.Feature(vocabulary=vocab_for_full_lm, add_eos=True)
+    },
+    metric_fns=[],)
