@@ -223,6 +223,14 @@ def get_checkpoint_dir(checkpoints_dir: str, step: int) -> str:
   return os.path.join(checkpoints_dir, f'checkpoint_{step}')
 
 
+def get_step_from_checkpoint_dir(checkpoints_dir: str) -> Tuple[str, int]:
+  """Returns a step number and the parent directory."""
+  parent, checkpoint = os.path.split(checkpoints_dir)
+  if 'checkpoint_' not in checkpoint:
+    raise ValueError('Found improperly formatted checkpoint directory.')
+  return parent, int(checkpoint.replace('checkpoint_', ''))
+
+
 def _cast(target: PyTreeDef, dtype: jnp.dtype):
   """Cast arrays in target to dtype."""
 
@@ -411,6 +419,7 @@ class _TfDataCheckpointer:
     self._dataset_ckpt.read(filename).assert_consumed()
 
 
+# TODO(b/216649487): Replace with CheckpointManager.
 class Checkpointer(object):
   """Handles saving and restoring potentially-sharded T5X checkpoints.
 
@@ -1268,6 +1277,74 @@ class CheckpointerConstructor(typing_extensions.Protocol):
     pass
 
 
+def populate_metrics_for_steps(checkpoints_dir: str, metric_name: str,
+                               steps: Iterable[int]) -> Mapping[int, float]:
+  """Iterate through summary event files and return metrics for `steps`."""
+
+  metric_run, metric_tag = None, None
+
+  def _try_fill_metric_run_and_tag_names(metric_name: str,
+                                         run_keys: Iterable[str]) -> bool:
+    """Extract metric run and tag names by matching one of the `run_keys`.
+
+    This function tries to greedily split user-provided metric_name_to_monitor
+    into {run} and {tag} components. It does so by trying to match all available
+    {run}/{tag} names in the provided run_keys. If successful, populates
+    metric_run and metric_tag.
+
+    Args:
+      metric_name: metric name to monitor.
+      run_keys: Set of run keys to test for.
+
+    Returns:
+      Whether metric name prefix matches one of the run keys, and, as a
+      side-effect, populates metric_run and metric_tag.
+    """
+    nonlocal metric_run
+    nonlocal metric_tag
+
+    # Query existing events for different run and tags to match with user
+    # provided metric name.
+    m = metric_name.split('/')
+    possible_run_names = ['/'.join(m[:i]) for i in range(1, len(m))]
+    for key in run_keys:
+      for possible_run_name in possible_run_names:
+        if key == possible_run_name:
+          metric_run = possible_run_name
+          metric_tag = metric_name[len(metric_run) + 1:]
+          break
+
+    if metric_run and metric_tag:
+      return True
+    return False
+
+  metrics_by_step = {}
+  for subdir in io_wrapper.GetLogdirSubdirectories(checkpoints_dir):
+    rpath = os.path.relpath(subdir, checkpoints_dir)
+    # Skip runs that do not match user-specified metric.
+    if ((not metric_run and
+         not _try_fill_metric_run_and_tag_names(metric_name, (rpath,))) or
+        metric_run != rpath):
+      logging.info('Skipping events in %s', subdir)
+      continue
+
+    logging.info('Looking for events in %s', subdir)
+    loader = directory_watcher.DirectoryWatcher(
+        subdir, event_file_loader.EventFileLoader,
+        io_wrapper.IsTensorFlowEventsFile)
+    for event in loader.Load():
+      # Skip metric collection of events for unavailable checkpoints or for
+      # unmonitored tags.
+      if (event.step not in steps or not event.summary.value or
+          event.summary.value[0].tag != metric_tag):
+        continue
+      metric_value = tf.make_ndarray(event.summary.value[0].tensor)
+      metrics_by_step[event.step] = metric_value
+
+  return metrics_by_step
+
+
+# TODO(b/216649487): Replace with BestCheckpointManager.
 class SaveBestCheckpointer(Checkpointer):
   """A Checkpointer class that keeps checkpoints based on 'best' metrics.
 
@@ -1349,76 +1426,12 @@ class SaveBestCheckpointer(Checkpointer):
     if metric_mode not in ('max', 'min'):
       raise ValueError('Unsupported `metric_mode`: %s' % metric_mode)
 
-    # Metric run and tag names are derived from metric_name_to_monitor and are
-    # filled in _try_fill_metric_run_and_tag_names().
-    self._metric_run: Optional[str] = None
-    self._metric_tag: Optional[str] = None
     self._metric_name_to_monitor = metric_name_to_monitor
     self._metric_mode = metric_mode
     self._keep_checkpoints_without_metrics = keep_checkpoints_without_metrics
     self._force_keep_period = force_keep_period
     logging.info('Using SaveBestCheckpointer to keep %s best (%s) metric %s',
                  keep, metric_mode, metric_name_to_monitor)
-
-  def _populate_metrics_for_steps(self,
-                                  steps: Iterable[int]) -> Mapping[int, float]:
-    """Iterate through summary event files and return metrics for `steps`."""
-    metrics_by_step = {}
-    for subdir in io_wrapper.GetLogdirSubdirectories(self.checkpoints_dir):
-      rpath = os.path.relpath(subdir, self.checkpoints_dir)
-      # Skip runs that do not match user-specified metric.
-      if ((not self._metric_run and not self._try_fill_metric_run_and_tag_names(
-          (rpath,))) or self._metric_run != rpath):
-        logging.info('Skipping events in %s', subdir)
-        continue
-
-      logging.info('Looking for events in %s', subdir)
-      loader = directory_watcher.DirectoryWatcher(
-          subdir, event_file_loader.EventFileLoader,
-          io_wrapper.IsTensorFlowEventsFile)
-      for event in loader.Load():
-        # Skip metric collection of events for unavailable checkpoints or for
-        # unmonitored tags.
-        if (event.step not in steps or not event.summary.value or
-            event.summary.value[0].tag != self._metric_tag):
-          continue
-        metric_value = tf.make_ndarray(event.summary.value[0].tensor)
-        metrics_by_step[event.step] = metric_value
-
-    return metrics_by_step
-
-  def _try_fill_metric_run_and_tag_names(self, run_keys: Iterable[str]) -> bool:
-    """Extract metric run and tag names by matching one of the `run_keys`.
-
-    This function tries to greedily split user-provided metric_name_to_monitor
-    into {run} and {tag} components. It does so by trying to match all available
-    {run}/{tag} names in the provided run_keys. If successful, populates
-    self._metric_run and self._metric_tag.
-
-    Args:
-      run_keys: Set of run keys to test for.
-
-    Returns:
-      Whether metric name prefix matches one of the run keys, and, as a
-      side-effect, populates self._metric_run and self._metric_tag.
-    """
-    metric_run, metric_tag = None, None
-
-    # Query existing events for different run and tags to match with user
-    # provided metric name.
-    m = self._metric_name_to_monitor.split('/')
-    possible_run_names = ['/'.join(m[:i]) for i in range(1, len(m))]
-    for key in run_keys:
-      for possible_run_name in possible_run_names:
-        if key == possible_run_name:
-          metric_run = possible_run_name
-          metric_tag = self._metric_name_to_monitor[len(metric_run) + 1:]
-          break
-
-    if metric_run and metric_tag:
-      self._metric_run, self._metric_tag = metric_run, metric_tag
-      return True
-    return False
 
   def _filter_out_force_keep_period_steps(self, existing_steps):
     """Filter out steps that are divisible by keep_period excluding the last."""
@@ -1447,7 +1460,9 @@ class SaveBestCheckpointer(Checkpointer):
       return
 
     # Synchronous fetch of new events for existing_steps.
-    metrics_by_step = self._populate_metrics_for_steps(existing_steps)
+    metrics_by_step = populate_metrics_for_steps(self.checkpoints_dir,
+                                                 self._metric_name_to_monitor,
+                                                 existing_steps)
     logging.info('SaveBestcheckpointer: collected metrics %s', metrics_by_step)
 
     # Re-sort existing_steps by metric values while always keeping the latest
@@ -1875,7 +1890,7 @@ class TrainStateCheckpointHandler(orbax.checkpoint.PyTreeCheckpointHandler):
       if isinstance(leaf, ts.Spec):
         leaf = leaf.to_json()
         leaf = epath.Path(leaf['kvstore']['path']).name
-        leaf = orbax.checkpoint.utils.aggregated_placeholder(leaf)
+        leaf = orbax.checkpoint.utils.leaf_placeholder(leaf)
       return leaf
 
     return jax.tree_map(tensorstore_spec_to_name, result)
@@ -1931,17 +1946,6 @@ class NonAtomicCheckpointer(orbax.checkpoint.Checkpointer):
     self._handler.save(tmp_directory, item, *args, **kwargs)
     _sync_global_devices('Checkpointer:write')
 
-  def restore(self,
-              directory: epath.PathLike,
-              *args,
-              item: Optional[Any] = None,
-              override_path: Optional[epath.PathLike] = None,
-              **kwargs) -> Any:
-    """See superclass documentation."""
-    if override_path is not None:
-      directory = epath.Path(override_path)
-    return super().restore(directory, *args, item=item, **kwargs)
-
 
 # TODO(b/216649487) Support tracking best checkpoints by metrics.
 class CheckpointManager(orbax.checkpoint.CheckpointManager):
@@ -1956,10 +1960,9 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
       save_dtype: Optional[jnp.dtype] = None,
       restore_dtype: Optional[jnp.dtype] = None,
       keep: Optional[int] = None,
-      # TODO(b/216649487) Support keeping a different number of dataset
-      # checkpoints.
       keep_dataset_checkpoints: Optional[int] = None,
-      force_keep_period: Optional[int] = None):
+      force_keep_period: Optional[int] = None,
+      options: Optional[orbax.checkpoint.CheckpointManagerOptions] = None):
     self._train_state_shape = train_state_shape
     self._partitioner = partitioner
     self._dataset_iterator = dataset_iterator
@@ -1981,8 +1984,11 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
       checkpointers[_DATASET_KEY] = NonAtomicCheckpointer(
           DatasetCheckpointHandler(checkpoint_filename=dataset_ckpt_name))
 
-    options = orbax.checkpoint.CheckpointManagerOptions(
-        max_to_keep=keep, keep_period=force_keep_period)
+    if options is None:
+      options = orbax.checkpoint.CheckpointManagerOptions()
+    if options.max_to_keep is None:
+      options.max_to_keep = keep
+      options.force_keep_period = force_keep_period
     super().__init__(
         directory=directory, checkpointers=checkpointers, options=options)
 
@@ -2106,10 +2112,9 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
     """
     if step is not None and path is not None:
       raise ValueError('Can only provide `step` or `path` but not both.')
-    override_path = None
+    directory = self.directory
     if path is not None:
-      step = -1  # dummy value, unused
-      override_path = path
+      directory, step = get_step_from_checkpoint_dir(os.fspath(path))
 
     transforms = _transforms_from_state_transformation_fns(
         state_transformation_fns)
@@ -2160,14 +2165,11 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
         _STATE_KEY: {
             'restore_args': restore_args,
             'transforms': transforms,
-            'override_path': override_path,
         },
-        _DATASET_KEY: {
-            'override_path': override_path,
-        }
     }
 
-    restored = super().restore(step, items, restore_kwargs=restore_kwargs)
+    restored = super().restore(
+        step, items, restore_kwargs=restore_kwargs, directory=directory)
     state_dict = restored[_STATE_KEY]
     if self._should_write_dataset_ckpt:
       self._dataset_iterator = restored[_DATASET_KEY]
@@ -2179,13 +2181,11 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
 
     return train_state
 
-  def structure(self, override_path: Optional[str] = None) -> PyTreeDef:
+  def structure(self) -> PyTreeDef:
     """Retrieves structure from an existing checkpoint."""
     step = self.latest_step()
     if step is not None:
       ckpt_path = self._get_save_directory(step, self.directory)
-    elif override_path is not None:
-      ckpt_path = override_path
     else:
       raise ValueError(
           'No existing checkpoint; structure cannot be determined.')
@@ -2229,6 +2229,7 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
 
   def _add_checkpoint_info(self, step, metrics):
     """Record CheckpointInfo after save. Ensure save is atomic."""
+    assert metrics is None
     if jax.process_index() == 0:
       assert self._tmp_directory is not None
       final_directory = os.fspath(
@@ -2242,3 +2243,50 @@ class CheckpointManager(orbax.checkpoint.CheckpointManager):
         gfile.rename(tmp_directory, final_directory)
     _sync_global_devices('CheckpointManager:atomic_save')
     super()._add_checkpoint_info(step, metrics)
+
+  def _cleanup_tmp_directories(self):
+    if jax.process_index() == 0:
+      files = self.directory.glob('checkpoint_*')
+      tmp_files = [
+          f for f in files
+          if not orbax.checkpoint.utils.is_checkpoint_item_finalized(f)
+      ]
+      for tmp_file in tmp_files:
+        tmp_file.rmtree()
+    multihost_utils.sync_global_devices('cleanup_tmp_dirs')
+
+
+class BestCheckpointManager(CheckpointManager):
+  """Implementation of CheckpointManager interface for T5X."""
+
+  def __init__(self,
+               *args,
+               metric_name_to_monitor: str = 'train/accuracy',
+               metric_mode: str = 'max',
+               keep_checkpoints_without_metrics: bool = True,
+               **kwargs):
+    self._metric_name_to_monitor = metric_name_to_monitor
+
+    def best_fn(metrics):
+      return metrics[self._metric_name_to_monitor]
+
+    options = orbax.checkpoint.CheckpointManagerOptions(
+        best_fn=best_fn,
+        best_mode=metric_mode,
+        keep_checkpoints_without_metrics=keep_checkpoints_without_metrics)
+
+    super().__init__(*args, **kwargs, options=options)
+
+  def _finalize(self):
+    # Populate metrics before removing old checkpoints
+    if self._metric_name_to_monitor is not None:
+      step_to_metric = populate_metrics_for_steps(
+          os.fspath(self.directory), self._metric_name_to_monitor,
+          self.all_steps())
+      for info in self._checkpoints:
+        if info.step in step_to_metric:
+          metrics = {self._metric_name_to_monitor: step_to_metric[info.step]}
+          info.metrics = metrics
+
+    # Remove old checkpoints.
+    super()._finalize()

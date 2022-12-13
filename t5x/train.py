@@ -117,7 +117,7 @@ def train(
     total_steps: int,
     eval_steps: int,
     eval_period: int,
-    stats_period: Optional[int] = 1,
+    stats_period: Optional[int] = None,
     random_seed: Optional[int],
     use_hardware_rng: bool = False,
     summarize_config_fn: Callable[[str, metric_writers.MetricWriter, int],
@@ -224,6 +224,8 @@ def train(
 
   if use_orbax:
     logging.info('Checkpointing with Orbax enabled.')
+    if not use_gda:
+      raise ValueError('Must set of `use_gda` if `use_orbax` is enabled.')
 
   # Each "epoch" of the training loop should be the min of the eval period,
   # checkpoint period or the full training.
@@ -375,35 +377,35 @@ def train(
   if len(restore_paths) > 1:
     raise ValueError('Multiple restore paths not permitted in training.')
 
-  if use_orbax:
-    checkpoint_manager = utils.create_checkpoint_manager(
-        save_cfg=checkpoint_cfg.save,
-        restore_cfg=valid_restore_cfg,
-        train_state_shape=train_state_initializer.global_train_state_shape,
-        partitioner=partitioner,
-        ds_iter=train_iter,
-        model_dir=model_dir)
-    train_state = utils.restore(
-        checkpoint_manager, restore_paths, valid_restore_cfg,
-        utils.get_fallback_state(
-            valid_restore_cfg,
-            lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
-            init_rng))
-  else:
-    checkpoint_manager = utils.LegacyCheckpointManager(
-        save_cfg=checkpoint_cfg.save,
-        restore_cfg=valid_restore_cfg,
-        train_state_shape=train_state_initializer.global_train_state_shape,
-        partitioner=partitioner,
-        ds_iter=train_iter,
-        model_dir=model_dir,
-        use_gda=use_gda)
-    train_state = checkpoint_manager.restore(
-        restore_paths, valid_restore_cfg,
-        utils.get_fallback_state(
-            valid_restore_cfg,
-            lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
-            init_rng))
+  def _init(rng):
+    return train_state_initializer.from_scratch(rng).state_dict()
+
+  # Skip initialization if neither save nor restore is requested.
+  train_state = None
+  if valid_restore_cfg or checkpoint_period:
+    if use_orbax:
+      checkpoint_manager = utils.create_checkpoint_manager(
+          save_cfg=checkpoint_cfg.save,
+          restore_cfg=valid_restore_cfg,
+          train_state_shape=train_state_initializer.global_train_state_shape,
+          partitioner=partitioner,
+          ds_iter=train_iter,
+          model_dir=model_dir)
+      train_state = utils.restore(
+          checkpoint_manager, restore_paths, valid_restore_cfg,
+          utils.get_fallback_state(valid_restore_cfg, _init, init_rng))
+    else:
+      checkpoint_manager = utils.LegacyCheckpointManager(
+          save_cfg=checkpoint_cfg.save,
+          restore_cfg=valid_restore_cfg,
+          train_state_shape=train_state_initializer.global_train_state_shape,
+          partitioner=partitioner,
+          ds_iter=train_iter,
+          model_dir=model_dir,
+          use_gda=use_gda)
+      train_state = checkpoint_manager.restore(
+          restore_paths, valid_restore_cfg,
+          utils.get_fallback_state(valid_restore_cfg, _init, init_rng))
 
   # 3. If no checkpoint to restore, init from scratch.
   train_state = train_state or train_state_initializer.from_scratch(init_rng)
