@@ -3,9 +3,7 @@ include 't5x/configs/runs/pretrain.gin'
 
 import seqio
 import t5.data.mixtures
-import obpc_ul2_task_0
-import obpc_ul2_task
-import obpc_ul2_task_2
+import tasks
 
 VOCABULARY = @seqio.SentencePieceVocabulary()
 seqio.SentencePieceVocabulary.sentencepiece_model_file = "gs://large_language_models_ja_v3/spiece.model"
