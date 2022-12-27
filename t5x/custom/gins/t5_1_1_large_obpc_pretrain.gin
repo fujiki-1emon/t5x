@@ -1,5 +1,5 @@
 include 't5x/examples/t5/t5_1_1/large.gin'
-include '/home/fujiki/t5x/gins/obpc_pretrain.gin'
+include 'gins/obpc_pretrain.gin'
 
 import seqio
 import t5.data.mixtures
