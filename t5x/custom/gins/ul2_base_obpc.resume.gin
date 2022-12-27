@@ -1,0 +1,14 @@
+include 't5x/examples/t5/t5_1_1/base.gin'
+include 't5x/configs/runs/resume.gin'
+
+import seqio
+import t5.data.mixtures
+import tasks
+
+VOCABULARY = @seqio.SentencePieceVocabulary()
+seqio.SentencePieceVocabulary.sentencepiece_model_file = "gs://large_language_models_ja_v3/spiece.model"
+seqio.SentencePieceVocabulary.extra_ids = 100
+
+MIXTURE_OR_TASK_NAME = "pre_training.obpc.ul2_objective"
+TASK_FEATURE_LENGTHS = {"inputs": 512, "targets": 512}
+DROPOUT_RATE = 0.0
