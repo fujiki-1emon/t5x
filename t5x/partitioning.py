@@ -27,6 +27,7 @@ from flax.linen import partitioning as flax_partitioning
 import jax
 from jax import numpy as jnp
 from jax import random
+from jax.experimental import multihost_utils
 from jax.experimental import PartitionSpec
 from jax.experimental.maps import Mesh
 from jax.experimental.mesh_utils import create_hybrid_device_mesh
@@ -376,7 +377,8 @@ def default_mesh(num_partitions: int,
     elif num_partitions == 16:
       mps = (4, 2, 1, 2)
   # assume the use of megacore on TPU v4
-  elif device_kind == 'TPU v4' and bounds[3] == 1:
+  elif (device_kind == 'TPU v4' or
+        device_kind == 'TPU v4 lite') and bounds[3] == 1:
     if num_partitions == 1:
       mps = (1, 1, 1, 1)
     elif num_partitions == 2:
@@ -396,8 +398,10 @@ def default_mesh(num_partitions: int,
         mps = (1, 1, 16, 1)
       elif bounds[0] >= 8:
         mps = (8, 2, 1, 1)
-      else:
+      elif bounds[0] >= 4:
         mps = (4, 4, 1, 1)
+      else:
+        mps = (2, 2, 4, 1)
 
   if mps is None:
     raise ValueError('No default mesh for this configuration: specify '
@@ -680,9 +684,9 @@ class BasePartitioner(metaclass=abc.ABCMeta):
     replica_id = self._local_chunker.get_local_chunk_info(
         (batch_size,), [self._data_axis]).replica_id
     return DataLayout(
-        batch_size=batch_size,
-        shard_id=self._local_chunker.chunk_ids[self._data_axis],
-        num_shards=num_shards,
+        batch_size=int(batch_size),
+        shard_id=int(self._local_chunker.chunk_ids[self._data_axis]),
+        num_shards=int(num_shards),
         is_first_host_in_replica_set=(replica_id == 0))
 
   def get_local_chunk_info(
@@ -703,6 +707,9 @@ class BasePartitioner(metaclass=abc.ABCMeta):
         in_axis_resources=(train_state_axes, None),
         out_axis_resources=(train_state_axes, None),
         donate_argnums=(0,))
+    if jax.config.jax_array and jax.process_count() > 1:
+      train_state = multihost_utils.host_local_array_to_global_array(
+          train_state, self.mesh, train_state_axes)
     train_state, _ = p_id_fn(train_state, jnp.ones((), dtype=jnp.uint32))
     return train_state
 
